@@ -1,0 +1,174 @@
+name: Auto Rebuild on Upstream Changes
+
+on:
+  schedule:
+    # 每天 UTC 0 点（北京时间 8 点）检查一次上游
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "强制重新构建（忽略 SHA 比对）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout my fork (for state file)
+        uses: actions/checkout@v4
+        with:
+          path: fork
+
+      - name: Resolve upstream HEAD
+        id: upstream
+        run: |
+          SHA=$(git ls-remote https://github.com/cat3399/blbl.git refs/heads/main | cut -f1)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "upstream HEAD: $SHA"
+
+      - name: Compare with last built SHA
+        id: check
+        run: |
+          LAST=$(cat fork/.last_built_sha 2>/dev/null || echo "none")
+          NEW="${{ steps.upstream.outputs.sha }}"
+          echo "last built: $LAST"
+          if [ "${{ inputs.force }}" = "true" ] || [ "$LAST" != "$NEW" ]; then
+            echo "needs_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_build=false" >> "$GITHUB_OUTPUT"
+            echo "No upstream change. Skipping."
+          fi
+
+      - name: Clone upstream
+        if: steps.check.outputs.needs_build == 'true'
+        run: |
+          git clone --depth 1 https://github.com/cat3399/blbl.git upstream
+          VERSION=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' upstream/CHANGELOG.md 2>/dev/null | head -1 || echo "unknown")
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Patch AndroidManifest (remove ghost launcher entries)
+        if: steps.check.outputs.needs_build == 'true'
+        working-directory: upstream
+        run: |
+          MANIFEST="app/src/main/AndroidManifest.xml"
+
+          patch_alias() {
+            local alias_name="$1"
+            local target_activity="$2"
+            if ! grep -q "$alias_name" "$MANIFEST"; then
+              echo "::error::alias $alias_name not found in manifest"
+              exit 1
+            fi
+            # 在该 alias 区间内：开标签结尾 ">" 改 " />"，删 intent-filter 块，删原闭合标签
+            sed -i "/$alias_name/,/<\\/activity-alias>/{
+              s|${target_activity}\">|${target_activity}\" />|
+              /<intent-filter>/,/<\\/intent-filter>/d
+              /<\\/activity-alias>/d
+            }" "$MANIFEST"
+          }
+
+          patch_alias "MainLauncherTvPinkAlias" ".ui.SplashTvPinkActivity"
+          patch_alias "MainLauncherTvPinkIllustrationAlias" ".ui.SplashTvPinkIllustrationActivity"
+
+          # 验证：原本 3 个 LEANBACK_LAUNCHER，patch 后应只剩 1 个（Dark alias）
+          COUNT=$(grep -c "LEANBACK_LAUNCHER" "$MANIFEST")
+          if [ "$COUNT" != "1" ]; then
+            echo "::error::expected 1 LEANBACK_LAUNCHER after patch, got $COUNT"
+            exit 1
+          fi
+          echo "Manifest patched OK."
+
+      - name: Set up JDK 17
+        if: steps.check.outputs.needs_build == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Build debug APK
+        if: steps.check.outputs.needs_build == 'true'
+        working-directory: upstream
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleDebug \
+            -PversionName="${VERSION}-tvfix" \
+            -PversionCode="${{ github.run_number }}"
+
+      - name: Publish to GitHub Release
+        if: steps.check.outputs.needs_build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHORT=$(echo "${{ steps.upstream.outputs.sha }}" | cut -c1-7)
+          TAG="auto-${VERSION}-${SHORT}"
+          cd fork
+          gh release create "$TAG" \
+            "../upstream/app/build/outputs/apk/debug/app-debug.apk#blbl-${VERSION}-tvfix.apk" \
+            --title "$TAG" \
+            --notes "Auto-built from cat3399/blbl@${SHORT}. 已去除创维/酷开 Android 5 TV 上的幽灵图标 alias 入口。" \
+            --target main
+
+            }" "$MANIFEST"
+          }
+
+          patch_alias "MainLauncherTvPinkAlias" ".ui.SplashTvPinkActivity"
+          patch_alias "MainLauncherTvPinkIllustrationAlias" ".ui.SplashTvPinkIllustrationActivity"
+
+          # 验证：原本 3 个 LEANBACK_LAUNCHER，patch 后应只剩 1 个（Dark alias）
+          COUNT=$(grep -c "LEANBACK_LAUNCHER" "$MANIFEST")
+          if [ "$COUNT" != "1" ]; then
+            echo "::error::expected 1 LEANBACK_LAUNCHER after patch, got $COUNT"
+            exit 1
+          fi
+          echo "Manifest patched OK."
+
+      - name: Set up JDK 17
+        if: steps.check.outputs.needs_build == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Build debug APK
+        if: steps.check.outputs.needs_build == 'true'
+        working-directory: upstream
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleDebug \
+            -PversionName="${VERSION}-tvfix" \
+            -PversionCode="${{ github.run_number }}"
+
+      - name: Publish to GitHub Release
+        if: steps.check.outputs.needs_build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHORT=$(echo "${{ steps.upstream.outputs.sha }}" | cut -c1-7)
+          TAG="auto-${VERSION}-${SHORT}"
+          cd fork
+          gh release create "$TAG" \
+            "../upstream/app/build/outputs/apk/debug/app-debug.apk#blbl-${VERSION}-tvfix.apk" \
+            --title "$TAG" \
+            --notes "Auto-built from cat3399/blbl@${SHORT}. 已去除创维/酷开 Android 5 TV 上的幽灵图标 alias 入口。" \
+            --target main
+
+      - name: Record last built SHA
+        if: steps.check.outputs.needs_build == 'true'
+        run: |
+          cd fork
+          echo "${{ steps.upstream.outputs.sha }}" > .last_built_sha
+          git config user.email "actions@users.noreply.github.com"
+          git config user.name "GitHub Actions"
+          git add .last_built_sha
+          if git diff --cached --quiet; then
+            echo "No SHA change to commit."
+          else
+            git commit -m "Update .last_built_sha to ${{ steps.upstream.outputs.sha }}"
+            git push
+          fi
