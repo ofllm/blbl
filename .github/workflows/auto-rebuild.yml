@@ -1,15 +1,19 @@
-name: Auto Rebuild on Upstream Changes
+name: Auto Rebuild on Upstream Release
 
 on:
   schedule:
-    # 每天 UTC 0 点（北京时间 8 点）检查一次上游
+    # 每天 UTC 0 点（北京时间 8 点）检查一次上游 latest release
     - cron: "0 0 * * *"
   workflow_dispatch:
     inputs:
       force:
-        description: "强制重新构建（忽略 SHA 比对）"
+        description: "强制重新构建（忽略已构建标记）"
         type: boolean
         default: false
+      upstream_tag:
+        description: "可选：指定上游 tag 构建，留空则用 latest release"
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -23,32 +27,44 @@ jobs:
         with:
           path: fork
 
-      - name: Resolve upstream HEAD
+      - name: Resolve upstream release
         id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          SHA=$(git ls-remote https://github.com/cat3399/blbl.git refs/heads/main | cut -f1)
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          echo "upstream HEAD: $SHA"
+          if [ -n "${{ inputs.upstream_tag }}" ]; then
+            TAG="${{ inputs.upstream_tag }}"
+          else
+            TAG=$(gh api repos/cat3399/blbl/releases/latest --jq .tag_name)
+          fi
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "::error::Failed to resolve upstream release tag"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "upstream release: $TAG (version=$VERSION)"
 
-      - name: Compare with last built SHA
+      - name: Compare with last built release
         id: check
         run: |
-          LAST=$(cat fork/.last_built_sha 2>/dev/null || echo "none")
-          NEW="${{ steps.upstream.outputs.sha }}"
+          LAST=$(cat fork/.last_built_release 2>/dev/null || echo "none")
+          NEW="${{ steps.upstream.outputs.tag }}"
           echo "last built: $LAST"
+          echo "upstream:   $NEW"
           if [ "${{ inputs.force }}" = "true" ] || [ "$LAST" != "$NEW" ]; then
             echo "needs_build=true" >> "$GITHUB_OUTPUT"
           else
             echo "needs_build=false" >> "$GITHUB_OUTPUT"
-            echo "No upstream change. Skipping."
+            echo "No new upstream release. Skipping."
           fi
 
-      - name: Clone upstream
+      - name: Clone upstream at release tag
         if: steps.check.outputs.needs_build == 'true'
         run: |
-          git clone --depth 1 https://github.com/cat3399/blbl.git upstream
-          VERSION=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' upstream/CHANGELOG.md 2>/dev/null | head -1 || echo "unknown")
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          git clone --depth 1 --branch "${{ steps.upstream.outputs.tag }}" \
+            https://github.com/cat3399/blbl.git upstream
 
       - name: Patch AndroidManifest (remove ghost launcher entries)
         if: steps.check.outputs.needs_build == 'true'
@@ -94,20 +110,20 @@ jobs:
         run: |
           chmod +x ./gradlew
           ./gradlew assembleDebug \
-            -PversionName="${VERSION}-tvfix" \
+            -PversionName="${{ steps.upstream.outputs.version }}-tvfix" \
             -PversionCode="${{ github.run_number }}"
 
       - name: Publish to GitHub Release
         if: steps.check.outputs.needs_build == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          SHA: ${{ steps.upstream.outputs.sha }}
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+          VERSION: ${{ steps.upstream.outputs.version }}
         run: |
-          SHORT="${SHA:0:7}"
-          TAG="auto-${VERSION}-${SHORT}"
+          TAG="${UPSTREAM_TAG}-tvfix"
           cd fork
           {
-            echo "Auto-built from cat3399/blbl@${SHORT}."
+            echo "Auto-built from cat3399/blbl release ${UPSTREAM_TAG}."
             echo ""
             echo "已去除创维/酷开 Android 5 TV 上的幽灵图标 alias 入口。"
           } > release_notes.md
@@ -125,17 +141,20 @@ jobs:
               --target main
           fi
 
-      - name: Record last built SHA
+      - name: Record last built release
         if: steps.check.outputs.needs_build == 'true'
         run: |
           cd fork
-          echo "${{ steps.upstream.outputs.sha }}" > .last_built_sha
+          echo "${{ steps.upstream.outputs.tag }}" > .last_built_release
+          if [ -f .last_built_sha ]; then
+            git rm .last_built_sha
+          fi
           git config user.email "actions@users.noreply.github.com"
           git config user.name "GitHub Actions"
-          git add .last_built_sha
+          git add .last_built_release
           if git diff --cached --quiet; then
-            echo "No SHA change to commit."
+            echo "No state change to commit."
           else
-            git commit -m "Update .last_built_sha to ${{ steps.upstream.outputs.sha }}"
+            git commit -m "Update .last_built_release to ${{ steps.upstream.outputs.tag }}"
             git push
           fi
