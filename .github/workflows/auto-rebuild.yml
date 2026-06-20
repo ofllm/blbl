@@ -104,12 +104,22 @@ jobs:
           java-version: "17"
           cache: gradle
 
-      - name: Build debug APK
+      - name: Build release APK
         if: steps.check.outputs.needs_build == 'true'
         working-directory: upstream
+        env:
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
         run: |
+          if [ -z "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" ]; then
+            echo "::error::RELEASE_KEYSTORE_BASE64 secret 未配置，无法进行 release 签名"
+            exit 1
+          fi
+          mkdir -p keystore
+          echo "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" | base64 -d > keystore/release.keystore
           chmod +x ./gradlew
-          ./gradlew assembleDebug \
+          ./gradlew assembleRelease \
             -PversionName="${{ steps.upstream.outputs.version }}-tvfix" \
             -PversionCode="${{ github.run_number }}"
 
@@ -128,7 +138,7 @@ jobs:
             echo "已去除创维/酷开 Android 5 TV 上的幽灵图标 alias 入口。"
           } > release_notes.md
 
-          APK="../upstream/app/build/outputs/apk/debug/app-debug.apk"
+          APK="../upstream/app/build/outputs/apk/release/app-release.apk"
           ASSET="${APK}#blbl-${VERSION}-tvfix.apk"
 
           if gh release view "$TAG" >/dev/null 2>&1; then
